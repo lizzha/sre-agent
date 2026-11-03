@@ -1,45 +1,71 @@
-# Verify the PowerShell exporter reports missing PyYAML before contacting Azure.
+#requires -Version 7.0
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-$Exporter = Join-Path $Root 'bin/ps/Export-Agent.ps1'
-$Pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+$Exporter = Join-Path $Root 'bin\ps\Export-Agent.ps1'
+$Pwsh = (Get-Process -Id $PID).Path
 $TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "sre-export-prereq-$([guid]::NewGuid())"
-$FakeBin = Join-Path $TempRoot 'bin'
-New-Item -ItemType Directory -Path $FakeBin -Force | Out-Null
+New-Item -ItemType Directory -Path $TempRoot | Out-Null
 
 try {
-    $fakePython = @'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-c" && "${2:-}" == *"import yaml"* ]]; then
-  exit 1
-fi
-exit 0
+    $probe = @'
+param([string]$Exporter, [string]$Mode)
+$ErrorActionPreference = 'Stop'
+
+function Get-Module {
+    param([string]$Name, [switch]$ListAvailable)
+    if ($Mode -eq 'import-failure') { [pscustomobject]@{ Name = 'powershell-yaml' } }
+}
+function Install-Module {
+    param([string]$Name, [string]$Scope, [string]$Repository, [switch]$Force, [string]$ErrorAction)
+    if ($Name -ne 'powershell-yaml' -or $Scope -ne 'CurrentUser' -or $Repository -ne 'PSGallery' -or -not $Force) {
+        throw 'Incorrect installation options.'
+    }
+    Write-Host 'TEST: installation attempted'
+    if ($Mode -eq 'install-failure') { throw 'Simulated installation failure.' }
+}
+function Import-Module {
+    param([string]$Name, [string]$Scope, [string]$ErrorAction)
+    if ($Name -ne 'powershell-yaml' -or $Scope -ne 'Local') { throw 'Incorrect import options.' }
+    throw 'Simulated import failure.'
+}
+function az { throw 'Azure must not be contacted when a prerequisite fails.' }
+
+& $Exporter -Subscription test-subscription -ResourceGroup test-resource-group -AgentName test-agent `
+    -NoInstallDependencies:($Mode -in @('missing', 'import-failure'))
+exit $LASTEXITCODE
 '@
-    foreach ($name in @('python3', 'python')) {
-        $path = Join-Path $FakeBin $name
-        Set-Content -Path $path -Value $fakePython -NoNewline
-        & chmod +x $path
+    $probePath = Join-Path $TempRoot 'probe.ps1'
+    Set-Content -LiteralPath $probePath -Value $probe
+    foreach ($mode in @('missing', 'install-failure', 'import-failure', 'install-then-import')) {
+        $output = & $Pwsh -NoLogo -NoProfile -File $probePath -Exporter $Exporter -Mode $mode 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        if ($exitCode -eq 0) { throw "Exporter unexpectedly succeeded: $mode" }
+        if ($text -match 'Azure must not be contacted|Connecting to agent') {
+            throw "Exporter contacted Azure before validating prerequisites: $text"
+        }
+        if ($mode -eq 'missing') {
+            if ($text -notmatch 'powershell-yaml is required' -or $text -notmatch 'Install-Module -Name powershell-yaml -Scope CurrentUser') {
+                throw "Missing dependency guidance: $text"
+            }
+            if ($text -match 'TEST: installation attempted') { throw '-NoInstallDependencies was ignored.' }
+        } elseif ($mode -eq 'install-failure') {
+            if ($text -notmatch 'Could not install powershell-yaml: Simulated installation failure') {
+                throw "Installation failure was not reported: $text"
+            }
+        } else {
+            if ($text -notmatch 'Could not import powershell-yaml: Simulated import failure') {
+                throw "Import failure was not reported: $text"
+            }
+            if ($mode -eq 'install-then-import' -and $text -notmatch 'TEST: installation attempted') {
+                throw "Automatic installation did not run: $text"
+            }
+            if ($mode -eq 'import-failure' -and $text -match 'TEST: installation attempted') {
+                throw "An installed module was unnecessarily reinstalled: $text"
+            }
+        }
+        Write-Host "PASS: YAML prerequisite $mode"
     }
-
-    $oldPath = $env:PATH
-    $env:PATH = "$FakeBin$([IO.Path]::PathSeparator)$oldPath"
-    $output = & $Pwsh -NoLogo -NoProfile -File $Exporter `
-        -Subscription test-subscription `
-        -ResourceGroup test-resource-group `
-        -AgentName test-agent `
-        -NoInstallDependencies 2>&1
-    $exitCode = $LASTEXITCODE
-
-    if ($exitCode -eq 0) { throw 'Exporter unexpectedly succeeded without PyYAML.' }
-    $text = $output -join "`n"
-    if ($text -notmatch 'Python 3 with PyYAML is required') {
-        throw "Missing PyYAML requirement message. Output: $text"
-    }
-    if ($text -notmatch 'Install-Prerequisites.ps1') {
-        throw "Missing prerequisite installer guidance. Output: $text"
-    }
-    Write-Host 'PASS: PowerShell exporter reports missing PyYAML before Azure export'
 } finally {
-    if ($oldPath) { $env:PATH = $oldPath }
-    Remove-Item -Recurse -Force $TempRoot -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TempRoot -Recurse -Force
 }
