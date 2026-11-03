@@ -5,8 +5,10 @@
 .DESCRIPTION
     Reads ARM child resources and data-plane configuration and emits JSON, YAML,
     and markdown files for Deploy-Agent.ps1 / Apply-Extras.ps1.
-    JSON is processed with PowerShell's ConvertFrom-Json and ConvertTo-Json;
-    The powershell-yaml module is required for YAML serialization.
+    JSON is processed as dictionaries with ConvertFrom-Json and ConvertTo-Json.
+    The approved powershell-yaml module writes JSON-compatible YAML to preserve
+    scalar types without requiring non-core .NET objects in ConstrainedLanguage.
+    RestrictedLanguage does not support running this script.
 
     Layout:
       <output>/
@@ -134,7 +136,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit 1
 }
 
-if (-not (Get-Module -ListAvailable -Name powershell-yaml)) {
+if (-not (Get-Module -Name powershell-yaml) -and -not (Get-Module -ListAvailable -Name powershell-yaml)) {
     if ($NoInstallDependencies) {
         Write-Host 'Error: powershell-yaml is required to write exported YAML files.' -ForegroundColor Red
         Write-Host 'Install it with: Install-Module -Name powershell-yaml -Scope CurrentUser -Repository PSGallery' -ForegroundColor Yellow
@@ -175,16 +177,8 @@ function Get-ConfigValue {
         $value = $Object
         foreach ($part in $path.Split('.')) {
             if ($null -eq $value) { break }
-            if ($value -is [System.Collections.IDictionary]) {
-                $value = $value[$part]
-            } else {
-                $property = $value.PSObject.Properties[$part]
-                if ($null -ne $property) {
-                    $value = $property.Value
-                } else {
-                    $value = $null
-                }
-            }
+            if ($value -isnot [System.Collections.IDictionary]) { $value = $null; break }
+            $value = $value[$part]
         }
         if ($null -ne $value) { return ,$value }
     }
@@ -193,11 +187,8 @@ function Get-ConfigValue {
 
 function Set-ConfigValue {
     param([object]$Object, [string]$Name, [AllowNull()][object]$Value)
-    if ($Object -is [System.Collections.IDictionary]) {
-        $Object[$Name] = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
-    }
+    if ($Object -isnot [System.Collections.IDictionary]) { throw "Expected a dictionary when setting '$Name'." }
+    $Object[$Name] = $Value
 }
 
 function Get-ResponseItems {
@@ -207,9 +198,7 @@ function Get-ResponseItems {
     if ($items -is [array]) {
         $items
     } elseif ($items -is [System.Collections.IDictionary]) {
-        $items.Values
-    } elseif ($items -is [pscustomobject]) {
-        $items.PSObject.Properties | ForEach-Object { $_.Value }
+        $items.PSBase.Values
     } else {
         $items
     }
@@ -229,12 +218,6 @@ function ConvertTo-ExportYamlValue {
         $Value = $json.Substring(1, $json.Length - 2)
     }
     if ($Value -is [string]) {
-        # YAML 1.1 readers otherwise interpret date-like strings as timestamps.
-        if ($Value -match '^\d{4}-\d{1,2}-\d{1,2}(?:$|[Tt \t])') {
-            $scalar = [YamlDotNet.RepresentationModel.YamlScalarNode]::new($Value)
-            $scalar.Style = 'DoubleQuoted'
-            return $scalar
-        }
         return $Value
     }
     if ($Value -is [array]) {
@@ -245,20 +228,10 @@ function ConvertTo-ExportYamlValue {
     }
     if ($Value -is [System.Collections.IDictionary]) {
         $copy = [ordered]@{}
-        foreach ($key in $Value.Keys) {
+        foreach ($key in $Value.PSBase.Keys) {
             if ($null -ne $Value[$key]) {
                 $yamlKey = ConvertTo-ExportYamlValue $key
                 $copy[$yamlKey] = ConvertTo-ExportYamlValue $Value[$key]
-            }
-        }
-        return $copy
-    }
-    if ($Value -is [pscustomobject]) {
-        $copy = [ordered]@{}
-        foreach ($property in $Value.PSObject.Properties) {
-            if ($null -ne $property.Value) {
-                $yamlKey = ConvertTo-ExportYamlValue $property.Name
-                $copy[$yamlKey] = ConvertTo-ExportYamlValue $property.Value
             }
         }
         return $copy
@@ -270,7 +243,7 @@ function ConvertTo-ExportYaml {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return "null`n" }
     $clean = ConvertTo-ExportYamlValue $Value
-    $result = powershell-yaml\ConvertTo-Yaml -Data $clean -ErrorAction Stop
+    $result = powershell-yaml\ConvertTo-Yaml -Data $clean -JsonCompatible -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($result)) { throw 'powershell-yaml returned empty YAML.' }
     return $result
 }
@@ -292,7 +265,7 @@ function Invoke-ArmGet {
         _warn "Could not read ARM resource ${Url}: $($_.Exception.Message)"
         return $null
     }
-    return ,(ConvertFrom-Json -InputObject $result -NoEnumerate)
+    return ,(ConvertFrom-Json -InputObject $result -AsHashtable -NoEnumerate)
 }
 
 function Invoke-ArmList {
@@ -328,7 +301,7 @@ function Invoke-DpGet {
         return $null
     }
     if (-not $response.Content) { return $null }
-    return ,(ConvertFrom-Json -InputObject $response.Content -NoEnumerate)
+    return ,(ConvertFrom-Json -InputObject $response.Content -AsHashtable -NoEnumerate)
 }
 
 function Invoke-DpDownload {
@@ -351,7 +324,7 @@ function Invoke-DpDownloadTarball {
     $ok = $false
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         $token = Get-DpToken
-        $tmpfile = [System.IO.Path]::GetTempFileName()
+        $tmpfile = (New-TemporaryFile -ErrorAction Stop).FullName
         try {
             Invoke-WebRequest -Uri "${AGENT_ENDPOINT}${Path}" -Headers @{ Authorization = "Bearer $token" } `
                 -UseBasicParsing -OutFile $tmpfile -ErrorAction Stop
@@ -377,16 +350,48 @@ function Invoke-DpDownloadTarball {
     return $ok
 }
 
+function ConvertFrom-Base64Utf8 {
+    param([string]$Encoded)
+    # System.Convert and Encoding methods are unavailable in ConstrainedLanguage.
+    $text = $Encoded -replace '[ \t\r\n]', ''
+    if ($text -cnotmatch '^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$') {
+        throw 'Invalid Base64 ARM configuration.'
+    }
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    $bytes = [byte[]]@(
+        for ($i = 0; $i -lt $text.Length; $i += 4) {
+            $a = $alphabet.IndexOf($text[$i])
+            $b = $alphabet.IndexOf($text[$i + 1])
+            [byte](($a -shl 2) -bor ($b -shr 4))
+            if ($text[$i + 2] -ne '=') {
+                $c = $alphabet.IndexOf($text[$i + 2])
+                [byte]((($b -band 15) -shl 4) -bor ($c -shr 2))
+                if ($text[$i + 3] -ne '=') {
+                    $d = $alphabet.IndexOf($text[$i + 3])
+                    [byte]((($c -band 3) -shl 6) -bor $d)
+                }
+            }
+        }
+    )
+    $temp = (New-TemporaryFile -ErrorAction Stop).FullName
+    try {
+        Set-Content -LiteralPath $temp -Value $bytes -AsByteStream
+        return (Get-Content -LiteralPath $temp -Raw -Encoding utf8) -join ''
+    } finally {
+        Remove-Item -LiteralPath $temp -Force
+    }
+}
+
 function ConvertFrom-OpaqueArm {
     param([object[]]$Resources)
     foreach ($resource in $Resources) {
         $encoded = Get-ConfigValue $resource @('properties.value') ''
-        $spec = if ($encoded -eq '') { [pscustomobject]@{} } else {
-            $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
-            ConvertFrom-Json -InputObject $decoded -NoEnumerate
+        $spec = if ($encoded -eq '') { @{} } else {
+            $decoded = ConvertFrom-Base64Utf8 $encoded
+            ConvertFrom-Json -InputObject $decoded -AsHashtable -NoEnumerate
         }
-        [pscustomobject]@{
-            metadata = [pscustomobject]@{ name = ($resource.name -split '/')[-1] }
+        [ordered]@{
+            metadata = @{ name = ($resource.name -split '/')[-1] }
             spec = $spec
         }
     }
@@ -394,11 +399,11 @@ function ConvertFrom-OpaqueArm {
 
 function ConvertTo-SkillConfig {
     param([string]$Name, [object]$Properties)
-    [pscustomobject]@{
-        metadata = [pscustomobject]@{
+    [ordered]@{
+        metadata = [ordered]@{
             name = $Name
             description = Get-ConfigValue $Properties @('description') ''
-            spec = [pscustomobject]@{ tools = Get-ConfigValue $Properties @('tools') @() }
+            spec = @{ tools = Get-ConfigValue $Properties @('tools') @() }
         }
         skillContent = Get-ConfigValue $Properties @('skillContent') ''
         additionalFiles = Get-ConfigValue $Properties @('additionalFiles') @()
@@ -417,16 +422,16 @@ function ConvertTo-ResourceConfig {
     param([object]$Response, [switch]$PreserveProperties, [string]$DefaultType = '')
     foreach ($item in @(Get-ResponseItems $Response)) {
         if ($PreserveProperties) {
-            [pscustomobject]@{
+            [ordered]@{
                 name = Get-ConfigValue $item @('name')
                 type = Get-ConfigValue $item @('type') $DefaultType
                 tags = Get-ConfigValue $item @('tags') @()
-                properties = Get-ConfigValue $item @('properties') ([pscustomobject]@{})
+                properties = Get-ConfigValue $item @('properties') @{}
             }
         } else {
-            [pscustomobject]@{
-                metadata = [pscustomobject]@{ name = Get-ConfigValue $item @('name') }
-                spec = Get-ConfigValue $item @('properties') ([pscustomobject]@{})
+            [ordered]@{
+                metadata = @{ name = Get-ConfigValue $item @('name') }
+                spec = Get-ConfigValue $item @('properties') @{}
             }
         }
     }
@@ -452,15 +457,8 @@ function Invoke-Sanitize {
     }
     if ($Value -is [System.Collections.IDictionary]) {
         $copy = [ordered]@{}
-        foreach ($key in $Value.Keys) { $copy[$key] = Invoke-Sanitize $Value[$key] }
+        foreach ($key in $Value.PSBase.Keys) { $copy[$key] = Invoke-Sanitize $Value[$key] }
         return $copy
-    }
-    if ($Value -is [pscustomobject]) {
-        $copy = [ordered]@{}
-        foreach ($property in $Value.PSObject.Properties) {
-            $copy[$property.Name] = Invoke-Sanitize $property.Value
-        }
-        return [pscustomobject]$copy
     }
     return ,$Value
 }
@@ -492,8 +490,8 @@ $ACCESS_LEVEL = Get-ConfigValue $AGENT @('properties.actionConfiguration.accessL
 $ACTION_MODE = Get-ConfigValue $AGENT @('properties.actionConfiguration.mode', 'properties.actionMode') 'Review'
 $UPGRADE_CHANNEL = Get-ConfigValue $AGENT @('properties.upgradeChannel') 'Preview'
 $DEFAULT_MODEL_PROVIDER = Get-ConfigValue $AGENT @('properties.defaultModelProvider') 'Anthropic'
-$identities = Get-ConfigValue $AGENT @('identity.userAssignedIdentities') ([pscustomobject]@{})
-$identityNames = @($identities.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object -CaseSensitive)
+$identities = Get-ConfigValue $AGENT @('identity.userAssignedIdentities') @{}
+$identityNames = @($identities.PSBase.Keys | Sort-Object -CaseSensitive)
 $AGENT_UAMI = if ($identityNames.Count -gt 0) { $identityNames[0] } else { '' }
 
 _log "Location:       ${LOCATION}"
@@ -537,12 +535,12 @@ $CONNECTORS = @(
     foreach ($arm in $RAW_CONNECTORS) {
         $name = ($arm.name -split '/')[-1]
         $dp = $DP_CONNECTORS | Where-Object { $_.name -ceq $name } | Select-Object -First 1
-        [pscustomobject]@{
+        [ordered]@{
             name = $name
-            properties = [pscustomobject]@{
+            properties = [ordered]@{
                 dataConnectorType = Get-ConfigValue $dp @('properties.dataConnectorType') (Get-ConfigValue $arm @('properties.dataConnectorType'))
                 dataSource = Get-ConfigValue $dp @('properties.dataSource') (Get-ConfigValue $arm @('properties.dataSource') '')
-                extendedProperties = Get-ConfigValue $dp @('properties.extendedProperties') (Get-ConfigValue $arm @('properties.extendedProperties') ([pscustomobject]@{}))
+                extendedProperties = Get-ConfigValue $dp @('properties.extendedProperties') (Get-ConfigValue $arm @('properties.extendedProperties') @{})
                 identity = Get-ConfigValue $dp @('properties.identity') (Get-ConfigValue $arm @('properties.identity') 'system')
             }
         }
@@ -570,7 +568,7 @@ $SKILLS = @(
         ConvertFrom-SkillsArm $RAW_SKILLS
     } else {
         foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v2/extendedAgent/skills'))) {
-            ConvertTo-SkillConfig $item.name (Get-ConfigValue $item @('properties') ([pscustomobject]@{}))
+            ConvertTo-SkillConfig $item.name (Get-ConfigValue $item @('properties') @{})
         }
     }
 )
@@ -661,9 +659,9 @@ _log "  Found $($ALL_PLUGINS.Count) plugin config(s) total"
 _log 'Reading repos...'
 $REPOS = @(
     foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v2/repos/'))) {
-        [pscustomobject]@{
+        [ordered]@{
             name = Get-ConfigValue $item @('name')
-            spec = [pscustomobject]@{
+            spec = [ordered]@{
                 url = Get-ConfigValue $item @('properties.url') ''
                 type = (Get-ConfigValue $item @('properties.type') 'GitHub').ToLowerInvariant()
                 branch = Get-ConfigValue $item @('properties.branch') 'main'
@@ -678,15 +676,15 @@ _log 'Reading incident platforms...'
 $INCIDENT_PLATFORMS = @()
 $IM_TYPE = Get-ConfigValue $AGENT @('properties.incidentManagementConfiguration.type') 'None'
 if ($IM_TYPE -and $IM_TYPE -ne 'None' -and $IM_TYPE -ne 'null') {
-    $INCIDENT_PLATFORMS += [pscustomobject]@{
+    $INCIDENT_PLATFORMS += [ordered]@{
         name = $IM_TYPE.ToLowerInvariant()
-        spec = [pscustomobject]@{ platformType = $IM_TYPE }
+        spec = @{ platformType = $IM_TYPE }
     }
 }
 foreach ($platformType in @('azmonitor', 'pagerduty', 'servicenow')) {
     $result = Invoke-DpGet "/api/v2/incidents/indexing/${platformType}/configuration"
     if ($null -ne $result) {
-        $INCIDENT_PLATFORMS += [pscustomobject]@{
+        $INCIDENT_PLATFORMS += [ordered]@{
             name = $platformType
             spec = Get-ConfigValue $result @('spec', 'properties') $result
         }
@@ -698,9 +696,9 @@ _log "  Found ${INCIDENT_PLATFORM_COUNT} incident platform(s)"
 _log 'Reading plugin marketplaces...'
 $PLUGIN_MARKETPLACES = @(
     foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v2/plugins/marketplaces'))) {
-        [pscustomobject]@{
+        [ordered]@{
             name = Get-ConfigValue $item @('metadata.name', 'name')
-            spec = Get-ConfigValue $item @('spec', 'properties') ([pscustomobject]@{})
+            spec = Get-ConfigValue $item @('spec', 'properties') @{}
         }
     }
 )
@@ -709,9 +707,9 @@ _log "  Found $($PLUGIN_MARKETPLACES.Count) marketplace(s)"
 _log 'Reading plugin installations...'
 $PLUGIN_INSTALLATIONS = @(
     foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v2/plugins/installations'))) {
-        [pscustomobject]@{
+        [ordered]@{
             name = Get-ConfigValue $item @('metadata.name', 'name')
-            spec = Get-ConfigValue $item @('spec', 'properties') ([pscustomobject]@{})
+            spec = Get-ConfigValue $item @('spec', 'properties') @{}
         }
     }
 )
@@ -723,9 +721,9 @@ $triggerItems = Get-ConfigValue $triggerResponse @('value') @()
 if ($triggerResponse -is [array]) { $triggerItems = $triggerResponse }
 $HTTP_TRIGGERS = @(
     foreach ($item in $triggerItems) {
-        [pscustomobject]@{
+        [ordered]@{
             name = Get-ConfigValue $item @('name') ''
-            spec = [pscustomobject]@{
+            spec = [ordered]@{
                 description = Get-ConfigValue $item @('description') ''
                 prompt = Get-ConfigValue $item @('agentPrompt', 'prompt') ''
                 handlingAgent = Get-ConfigValue $item @('agent', 'handlingAgent') ''
@@ -766,7 +764,7 @@ if ($INCLUDE_KNOWLEDGE) {
             } else {
                 Get-ConfigValue $item @('indexStatus') 'unknown'
             }
-            [pscustomobject]@{
+            [ordered]@{
                 filename = Get-ConfigValue $item @('filename', 'name') ''
                 mimeType = Get-ConfigValue $item @('mimeType', 'contentType') 'application/octet-stream'
                 fileSize = Get-ConfigValue $item @('fileSize', 'size') 0
@@ -809,7 +807,7 @@ if ($INCLUDE_KNOWLEDGE_ITEMS) {
         foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v2/extendedAgent/connectors'))) {
             $type = Get-ConfigValue $item @('properties.dataConnectorType') ''
             if ($type -cnotmatch '^Knowledge') { continue }
-            [pscustomobject]@{
+            [ordered]@{
                 name = Get-ConfigValue $item @('name')
                 type = Get-ConfigValue $item @('type') 'KnowledgeItem'
                 dataConnectorType = $type
@@ -846,7 +844,7 @@ if ($INCLUDE_MEMORIES) {
     _log 'Reading synthesized knowledge...'
     $SYNTHESIZED_KNOWLEDGE = @(
         foreach ($item in @(Get-ResponseItems (Invoke-DpGet '/api/v1/WorkspaceMemory/list?type=synthesized-knowledge') @('files', 'value'))) {
-            [pscustomobject]@{
+            [ordered]@{
                 path = Get-ConfigValue $item @('path') ''
                 size = Get-ConfigValue $item @('size') 0
                 lastModified = Get-ConfigValue $item @('lastModified') ''
@@ -876,25 +874,25 @@ if ($INCLUDE_REPO_INSTRUCTIONS -and $REPO_COUNT -gt 0) {
                 $resolvedDir = (Resolve-Path $RI_DIR).Path
                 $files = @(
                     Get-ChildItem -Path $RI_DIR -File -Recurse | ForEach-Object {
-                        [pscustomobject]@{
+                        [ordered]@{
                             path = $_.FullName.Substring($resolvedDir.Length + 1)
-                            content = [System.IO.File]::ReadAllText($_.FullName)
+                            content = (Get-Content -LiteralPath $_.FullName -Raw -Encoding utf8) -join ''
                         }
                     }
                 )
-                $REPO_INSTRUCTIONS += [pscustomobject]@{ repo = $rname; files = $files }
+                $REPO_INSTRUCTIONS += @{ repo = $rname; files = $files }
             }
         } else {
             $files = @(
                 foreach ($item in @(Get-ResponseItems (Invoke-DpGet "/api/v1/WorkspaceMemory/list?type=repo-instructions&repo=${encodedRname}"))) {
-                    [pscustomobject]@{
+                    [ordered]@{
                         path = Get-ConfigValue $item @('path')
                         size = Get-ConfigValue $item @('size')
                     }
                 }
             )
             if ($files.Count -gt 0) {
-                $REPO_INSTRUCTIONS += [pscustomobject]@{
+                $REPO_INSTRUCTIONS += [ordered]@{
                     repo = $rname
                     files = $files
                     _note = 'Content not downloaded - omit -NoDownload to include'
@@ -911,7 +909,7 @@ _log 'Reading session insights...'
 $insightResponse = Invoke-DpGet '/api/v1/threads/insights?skip=0&take=1000'
 $SESSION_INSIGHTS = @(
     foreach ($item in (Get-ConfigValue $insightResponse @('insights') @())) {
-        [pscustomobject]@{
+        [ordered]@{
             id = Get-ConfigValue $item @('id')
             threadId = Get-ConfigValue $item @('threadId')
             title = Get-ConfigValue $item @('title')
@@ -964,7 +962,7 @@ if ($DryRun) {
 
 # Phase 5: Write structured output
 
-$EXPORT_DIR = if ([System.IO.Path]::IsPathRooted($Output)) { $Output } else { Join-Path $PWD $Output }
+$EXPORT_DIR = if (Split-Path -Path $Output -IsAbsolute) { $Output } else { Join-Path $PWD $Output }
 if (-not (Test-Path (Join-Path $EXPORT_DIR 'config'))) {
     New-Item -ItemType Directory -Path (Join-Path $EXPORT_DIR 'config') -Force | Out-Null
 }
@@ -1043,7 +1041,7 @@ foreach ($connector in $CONNECTORS_CLEAN) {
     if ($dsrc -cmatch 'BearerToken=([^;]+)') {
         $secretLines += "${ENV_PREFIX}_BEARER_TOKEN=$($Matches[1])"
         $ref = "`${${ENV_PREFIX}_BEARER_TOKEN}"
-        $newSource = [regex]::Replace($dsrc, 'BearerToken=[^;]+', [System.Text.RegularExpressions.MatchEvaluator]{ param($match) "BearerToken=$ref" })
+        $newSource = $dsrc -creplace 'BearerToken=[^;]+', ('BearerToken=' + $ref.Replace('$', '$$'))
         Set-ConfigValue $connector.properties 'dataSource' $newSource
     }
     $bt = Get-ConfigValue $connector @('properties.extendedProperties.bearerToken')
@@ -1141,14 +1139,14 @@ foreach ($skill in $SKILLS) {
     $skillDir = Join-Path $EXPORT_DIR 'config/skills'
     if (-not (Test-Path $skillDir)) { New-Item -ItemType Directory -Path $skillDir -Force | Out-Null }
     if ($skill.skillContent) {
-        [System.IO.File]::WriteAllText((Join-Path $skillDir "${sname}.md"), $skill.skillContent)
+        Set-Content -LiteralPath (Join-Path $skillDir "${sname}.md") -Value $skill.skillContent -NoNewline -Encoding utf8
     }
     for ($j = 0; $j -lt $skill.additionalFiles.Count; $j++) {
         $file = $skill.additionalFiles[$j]
         $afname = Get-ConfigValue $file @('name', 'path') "file-$j"
         $afDir = Join-Path $skillDir $sname
         if (-not (Test-Path $afDir)) { New-Item -ItemType Directory -Path $afDir -Force | Out-Null }
-        [System.IO.File]::WriteAllText((Join-Path $afDir $afname), (Get-ConfigValue $file @('content') ''))
+        Set-Content -LiteralPath (Join-Path $afDir $afname) -Value (Get-ConfigValue $file @('content') '') -NoNewline -Encoding utf8
         Set-ConfigValue $file 'content' "$sname/$afname"
     }
     $skill.skillContent = "skills/${sname}.md"
@@ -1162,12 +1160,12 @@ foreach ($subagent in $SUBAGENTS) {
     if (-not (Test-Path $saDir)) { New-Item -ItemType Directory -Path $saDir -Force | Out-Null }
     $instructions = Get-ConfigValue $subagent @('spec.instructions') ''
     if ($instructions) {
-        [System.IO.File]::WriteAllText((Join-Path $saDir "${name}.instructions.md"), $instructions)
+        Set-Content -LiteralPath (Join-Path $saDir "${name}.instructions.md") -Value $instructions -NoNewline -Encoding utf8
         Set-ConfigValue $subagent.spec 'instructions' "subagents/${name}.instructions.md"
     }
     $handoff = Get-ConfigValue $subagent @('spec.handoffDescription') ''
     if ($handoff.Length -gt 200) {
-        [System.IO.File]::WriteAllText((Join-Path $saDir "${name}.handoff.md"), $handoff)
+        Set-Content -LiteralPath (Join-Path $saDir "${name}.handoff.md") -Value $handoff -NoNewline -Encoding utf8
         Set-ConfigValue $subagent.spec 'handoffDescription' "${name}.handoff.md"
     }
     Write-Yaml (Join-Path $saDir "${name}.yaml") $subagent
@@ -1182,7 +1180,7 @@ foreach ($prompt in $ALL_PROMPTS) {
     $promptDir = Join-Path $EXPORT_DIR 'config/common-prompts'
     if (-not (Test-Path $promptDir)) { New-Item -ItemType Directory -Path $promptDir -Force | Out-Null }
     $text = Get-ConfigValue $prompt @('spec.prompt', 'properties.content', 'properties.prompt') ''
-    if ($text) { [System.IO.File]::WriteAllText((Join-Path $promptDir "${name}.md"), $text) }
+    if ($text) { Set-Content -LiteralPath (Join-Path $promptDir "${name}.md") -Value $text -NoNewline -Encoding utf8 }
     Write-Yaml (Join-Path $promptDir "${name}.yaml") $prompt
 }
 if ($PROMPT_COUNT -gt 0) { _log "  common-prompts: ${PROMPT_COUNT} prompt(s)" }
@@ -1225,7 +1223,7 @@ foreach ($insight in $SESSION_INSIGHTS) {
     if ($fname.Length -gt 80) { $fname = $fname.Substring(0, 80) }
     if (-not $fname) { $fname = $insight.id }
     if ($insight.insightMarkdown) {
-        [System.IO.File]::WriteAllText((Join-Path $siDir "${fname}.md"), $insight.insightMarkdown)
+        Set-Content -LiteralPath (Join-Path $siDir "${fname}.md") -Value $insight.insightMarkdown -NoNewline -Encoding utf8
     }
     $insight.insightMarkdown = "session-insights/${fname}.md"
     Write-Yaml (Join-Path $siDir "${fname}.yaml") $insight

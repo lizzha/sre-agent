@@ -13,7 +13,10 @@ $ErrorActionPreference = 'Stop'
 
 function Get-Module {
     param([string]$Name, [switch]$ListAvailable)
-    if ($Mode -eq 'import-failure') { [pscustomobject]@{ Name = 'powershell-yaml' } }
+    if (($Mode -eq 'import-failure' -and $ListAvailable) -or
+        ($Mode -eq 'loaded-import-failure' -and -not $ListAvailable)) {
+        [pscustomobject]@{ Name = 'powershell-yaml' }
+    }
 }
 function Install-Module {
     param([string]$Name, [string]$Scope, [string]$Repository, [switch]$Force, [string]$ErrorAction)
@@ -31,12 +34,12 @@ function Import-Module {
 function az { throw 'Azure must not be contacted when a prerequisite fails.' }
 
 & $Exporter -Subscription test-subscription -ResourceGroup test-resource-group -AgentName test-agent `
-    -NoInstallDependencies:($Mode -in @('missing', 'import-failure'))
+    -NoInstallDependencies:($Mode -in @('missing', 'import-failure', 'loaded-import-failure'))
 exit $LASTEXITCODE
 '@
     $probePath = Join-Path $TempRoot 'probe.ps1'
     Set-Content -LiteralPath $probePath -Value $probe
-    foreach ($mode in @('missing', 'install-failure', 'import-failure', 'install-then-import')) {
+    foreach ($mode in @('missing', 'install-failure', 'import-failure', 'loaded-import-failure', 'install-then-import')) {
         $output = & $Pwsh -NoLogo -NoProfile -File $probePath -Exporter $Exporter -Mode $mode 2>&1
         $exitCode = $LASTEXITCODE
         $text = $output -join "`n"
@@ -60,7 +63,7 @@ exit $LASTEXITCODE
             if ($mode -eq 'install-then-import' -and $text -notmatch 'TEST: installation attempted') {
                 throw "Automatic installation did not run: $text"
             }
-            if ($mode -eq 'import-failure' -and $text -match 'TEST: installation attempted') {
+            if ($mode -in @('import-failure', 'loaded-import-failure') -and $text -match 'TEST: installation attempted') {
                 throw "An installed module was unnecessarily reinstalled: $text"
             }
         }

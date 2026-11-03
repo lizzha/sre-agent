@@ -11,6 +11,9 @@ if ($errors.Count) { throw "Exporter did not parse: $($errors | Out-String)" }
 if ($source -match '\b(Invoke-Jq|jq)\b') { throw 'Exporter still references the removed JSON CLI.' }
 if ($source -match 'Test-Prerequisites|Invoke-Jq\.ps1') { throw 'Exporter still loads prerequisites for other scripts.' }
 if ($source -match '\b(python3?|PyYAML)\b') { throw 'Exporter still depends on Python.' }
+if ($source -match '\[pscustomobject\]|YamlDotNet|System\.IO\.|MatchEvaluator') {
+    throw 'Exporter still constructs objects or uses APIs blocked in constrained language.'
+}
 Import-Module powershell-yaml -ErrorAction Stop
 
 foreach ($function in $ast.FindAll({
@@ -31,7 +34,7 @@ function Assert-True {
 
 function Read-JsonFile {
     param([string]$RelativePath)
-    $value = ConvertFrom-Json -InputObject (Get-Content -LiteralPath (Join-Path $Output $RelativePath) -Raw)
+    $value = ConvertFrom-Json -InputObject (Get-Content -LiteralPath (Join-Path $Output $RelativePath) -Raw) -AsHashtable -NoEnumerate
     $value
 }
 
@@ -39,7 +42,7 @@ function Read-YamlFile {
     param([string]$RelativePath)
     $path = Join-Path $Output $RelativePath
     $value = powershell-yaml\ConvertFrom-Yaml -Yaml (Get-Content -LiteralPath $path -Raw) -ErrorAction Stop
-    ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $value -Depth 100) -NoEnumerate
+    ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $value -Depth 100) -AsHashtable -NoEnumerate
 }
 
 function New-OpaqueResource {
@@ -94,6 +97,44 @@ function tar {
     $global:LASTEXITCODE = 0
 }
 
+function Invoke-ConstrainedExport {
+    param([string]$Destination, [bool]$Download)
+    $ps = [powershell]::Create()
+    try {
+        # Load the approved module and test doubles before constraining this isolated runspace.
+        $setup = "Import-Module powershell-yaml -Global -ErrorAction Stop`n"
+        foreach ($name in @('Assert-True', 'az', 'Invoke-WebRequest', 'tar')) {
+            $definition = (Get-Command $name -CommandType Function).Definition
+            $setup += "function $name {`n$definition`n}`n"
+        }
+        $null = $ps.AddScript($setup).Invoke()
+        if ($ps.HadErrors) { throw (($ps.Streams.Error | ForEach-Object { "$($_.Exception.Message)`n$($_.ScriptStackTrace)" }) -join "`n") }
+        $ps.Commands.Clear()
+        $ps.Runspace.SessionStateProxy.SetVariable('ExportJsonTestState', $global:ExportJsonTestState)
+        $ps.Runspace.SessionStateProxy.LanguageMode = 'ConstrainedLanguage'
+        $null = $ps.AddCommand($exporter).
+            AddParameter('Subscription', 'test-sub').
+            AddParameter('ResourceGroup', 'test-rg').
+            AddParameter('AgentName', 'test-agent').
+            AddParameter('Output', $Destination).
+            AddParameter('Set', $SetOverrides).
+            AddParameter('NoInstallDependencies').
+            AddParameter('IncludeRepoInstructions')
+        if (-not $Download) { $null = $ps.AddParameter('NoDownload') }
+        $null = $ps.Invoke()
+        if ($ps.HadErrors) {
+            $details = @($ps.Streams.Error | ForEach-Object { "$($_.Exception.Message)`n$($_.ScriptStackTrace)" })
+            $details += @($ps.Streams.Information | ForEach-Object { [string]$_.MessageData })
+            throw ($details -join "`n")
+        }
+        $messages = ($ps.Streams.Information | ForEach-Object { [string]$_.MessageData }) -join "`n"
+        Assert-True ($messages -match '-- Export complete --') "Constrained export did not complete: $messages"
+        Assert-True ($ps.Runspace.SessionStateProxy.LanguageMode -eq 'ConstrainedLanguage') 'Exporter changed the language mode.'
+    } finally {
+        $ps.Dispose()
+    }
+}
+
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "export-json-test-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 $fixtureRoot = Join-Path $tempRoot 'fixture'
@@ -108,10 +149,10 @@ try {
         '2026-11-03' = 'date-key'
         timestamp = [datetime]::Parse('2026-11-03T10:50:48Z').ToUniversalTime()
         offsetTimestamp = [datetimeoffset]::Parse('2026-11-03T10:50:48-08:00')
-        emptyMap = [pscustomobject]@{}
+        emptyMap = @{}
         emptyArray = @()
-        nested = [pscustomobject]@{ removed = $null; zero = 0; flag = $false; empty = '' }
-        items = @($null, $false, 0, '', [pscustomobject]@{ removed = $null; kept = 'value' })
+        nested = @{ removed = $null; zero = 0; flag = $false; empty = '' }
+        items = @($null, $false, 0, '', @{ removed = $null; kept = 'value' })
         strings = @('true', 'false', 'null', 'on', 'off', 'yes', '123', '1.2', '2026-11-03', '2026-11-03T10:50:48Z', '${TOKEN}', 'a: b', '# heading')
         markdown = "# Heading`n`nLine with `"quotes`" and $([char]0x03BB).`n"
     }
@@ -142,7 +183,7 @@ try {
     Assert-True ((ConvertTo-ExportYaml $null).Trim() -eq 'null') 'Root YAML null changed.'
     Write-Host 'PASS: native YAML null removal, arrays, scalar types, strings, and multiline content'
 
-    $optional = ConvertFrom-Json -InputObject '{"zero":0,"flag":false,"empty":"","items":[],"missing":null}'
+    $optional = ConvertFrom-Json -InputObject '{"zero":0,"flag":false,"empty":"","items":[],"missing":null}' -AsHashtable
     Assert-True ((Get-ConfigValue $optional @('zero') 99) -eq 0) 'Zero was replaced by a default.'
     Assert-True ((Get-ConfigValue $optional @('flag') $true) -eq $false) 'False was replaced by a default.'
     Assert-True ((Get-ConfigValue $optional @('empty') 'fallback') -eq '') 'Empty string was replaced by a default.'
@@ -150,13 +191,30 @@ try {
     Assert-True ($empty -is [array] -and $empty.Count -eq 0) 'Empty array was replaced by a default.'
     Assert-True ((Get-ConfigValue $optional @('absent.nested', 'zero') 99) -eq 0) 'Optional nested path fallback failed.'
 
-    $sanitized = Invoke-Sanitize (ConvertFrom-Json -InputObject '{"values":[null,false,0,"","ghp_test","Bearer token","BearerToken=test;Url=x","accessToken=x","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"nested":{"unchanged":"hello"}}')
+    $sanitized = Invoke-Sanitize (ConvertFrom-Json -InputObject '{"values":[null,false,0,"","ghp_test","Bearer token","BearerToken=test;Url=x","accessToken=x","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"nested":{"unchanged":"hello"}}' -AsHashtable)
     Assert-True ($sanitized.values.Count -eq 9) 'Sanitizing changed array length.'
     Assert-True ($null -eq $sanitized.values[0] -and $sanitized.values[1] -eq $false -and $sanitized.values[2] -eq 0) 'Sanitizing changed non-string values.'
     Assert-True ($sanitized.values[3] -eq '' -and $sanitized.values[4] -eq 'EDIT_ME_GITHUB_PAT') 'Secret sanitizing changed.'
     Assert-True ($sanitized.values[5] -eq 'EDIT_ME_BEARER_TOKEN') 'Bearer secret was not sanitized.'
     Assert-True ($sanitized.values[6] -eq 'BearerToken=EDIT_ME_TOKEN;Url=x') 'Connection string was not sanitized.'
     Assert-True ($sanitized.values[7] -eq 'EDIT_ME_ACCESS_TOKEN' -and $sanitized.values[8] -eq 'EDIT_ME_SECRET') 'Token sanitizing changed.'
+
+    $reserved = @{ Keys = @('key-value'); Values = 'value-value'; Count = 0 }
+    $reservedCopy = Invoke-Sanitize $reserved
+    Assert-True ($reservedCopy['Keys'][0] -eq 'key-value' -and $reservedCopy['Values'] -eq 'value-value' -and $reservedCopy['Count'] -eq 0) 'Dictionary member names shadowed configuration keys.'
+    foreach ($length in @(0, 1, 2, 3, 4, 5, 6, 31, 128, 4096)) {
+        $text = ('x' * $length) + [char]0x03BB + [char]0xD83D + [char]0xDE80
+        $encodedText = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
+        Assert-True ((ConvertFrom-Base64Utf8 $encodedText) -ceq $text) "Base64 UTF-8 round trip failed for length $length."
+        Assert-True ((ConvertFrom-Base64Utf8 (" `t" + $encodedText + "`r`n")) -ceq $text) 'Base64 whitespace handling changed.'
+    }
+    Assert-True ((ConvertFrom-Base64Utf8 '') -eq '') 'Empty Base64 handling changed.'
+    foreach ($invalid in @('A', 'AA=', 'AAA', '====', 'A===', 'AAA!', 'AA==AAAA')) {
+        $failed = $false
+        try { ConvertFrom-Base64Utf8 $invalid | Out-Null } catch { $failed = $true }
+        Assert-True $failed 'Invalid Base64 must fail explicitly.'
+    }
+    Write-Host 'PASS: dictionary keys and Base64 padding, UTF-8, whitespace, and invalid input'
 
     $cases = @(
         @{ Name = 'empty'; Count = 0; Arm = $true; Wrapped = $true; Download = $false; Overrides = $false }
@@ -253,7 +311,7 @@ try {
                 skills = @{
                     description = 'A skill'
                     tools = $(if ($case.Name -eq 'single-arm') { ,@() } elseif ($i -gt 0) { ,@('ReadFile', 'ListDir') } else { ,@('ReadFile') })
-                    skillContent = "# Skill $i`nContent with quotes: `"hello`""
+                    skillContent = "# Skill $i`nContent with quotes: `"hello`" and $([char]0x03BB)"
                     additionalFiles = @(@{ name = 'guide.md'; content = '# Guide' })
                 }
                 scheduledTasks = @{ cron = '0 * * * *'; enabled = $false }
@@ -325,7 +383,7 @@ try {
         Assert-True ($connectorConfig.connectors -is [array]) "$($case.Name): connectors lost array shape."
         Assert-True ($connectorConfig.connectors.Count -eq $case.Count) "$($case.Name): wrong connector count."
         foreach ($field in @('skills', 'subagents', 'hooks', 'commonPrompts', 'scheduledTasks', 'responsePlans', 'repos')) {
-            $value = $expected.PSObject.Properties[$field].Value
+            $value = $expected[$field]
             Assert-True ($value -is [array] -and $value.Count -eq $case.Count) "$($case.Name): invalid $field array."
         }
         Assert-True ($expected.connectors -is [array]) 'Expected connectors lost array shape.'
@@ -394,6 +452,27 @@ try {
             Assert-True (-not (Test-Path -LiteralPath $download)) 'Temporary download was not cleaned up or moved.'
         }
         Write-Host "PASS: $($case.Name) export"
+        $constrainedOutput = "${Output}-constrained"
+        Invoke-ConstrainedExport $constrainedOutput $case.Download
+        foreach ($filename in @('agent.json', 'connectors.json', 'expected-config.json')) {
+            $actual = ConvertFrom-Json -InputObject (Get-Content -LiteralPath (Join-Path $constrainedOutput $filename) -Raw) -AsHashtable
+            $reference = ConvertFrom-Json -InputObject (Get-Content -LiteralPath (Join-Path $Output $filename) -Raw) -AsHashtable
+            if ($filename -eq 'agent.json') {
+                $actual.Remove('_exported_at')
+                $reference.Remove('_exported_at')
+            }
+            Assert-True ((ConvertTo-Json -InputObject $actual -Depth 100 -Compress) -ceq (ConvertTo-Json -InputObject $reference -Depth 100 -Compress)) "Constrained $filename differs."
+        }
+        $yamlFiles = @(Get-ChildItem -LiteralPath $Output -Recurse -Filter '*.yaml' -File)
+        $constrainedYamlFiles = @(Get-ChildItem -LiteralPath $constrainedOutput -Recurse -Filter '*.yaml' -File)
+        Assert-True ($yamlFiles.Count -eq $constrainedYamlFiles.Count) 'Constrained YAML file count differs.'
+        foreach ($file in $yamlFiles) {
+            $relative = $file.FullName.Substring($Output.Length + 1)
+            $reference = Get-Content -LiteralPath $file.FullName -Raw
+            $actual = Get-Content -LiteralPath (Join-Path $constrainedOutput $relative) -Raw
+            Assert-True ($actual -ceq $reference) "Constrained YAML differs: $relative"
+        }
+        Write-Host "PASS: $($case.Name) export in ConstrainedLanguage"
     }
 
     $script:DpResponses['/api/v2/extendedAgent/connectors'] = @{ value = @() }
